@@ -1,0 +1,158 @@
+#! /bin/sh
+# by pts@fazkeas.hu at Mon Nov 11 17:20:59 CET 2013
+
+""":" #git-dcommit: Create commit date based on file last-modification time.
+
+type python2.7 >/dev/null 2>&1 && exec python2.7 -- "$0" ${1+"$@"}
+type python2.6 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
+type python2.5 >/dev/null 2>&1 && exec python2.5 -- "$0" ${1+"$@"}
+type python2.4 >/dev/null 2>&1 && exec python2.4 -- "$0" ${1+"$@"}
+exec python -- ${1+"$@"}
+exit 1
+
+Takes the maximum last-modification date of files changed.
+"""
+
+import errno
+import os
+import os.path
+import stat
+import subprocess
+import sys
+import time
+
+
+def call(cmd):
+  exitcode = subprocess.call(cmd)
+  assert not exitcode, 'error: %r: %d' % (cmd, exitcode)
+
+
+def readpipe(cmd, stdin=None):
+  stdin_arg = stdin
+  if isinstance(stdin, str):
+    stdin_arg = subprocess.PIPE
+  else:
+    stdin = None
+  p = subprocess.Popen(cmd, stdin=stdin_arg, stdout=subprocess.PIPE)
+  try:
+    return p.communicate(stdin)[0]
+  finally:
+    exitcode = p.wait()
+    assert not exitcode, 'error: %r: %d' % (cmd, exitcode)
+
+
+def parse_commit_data(commit_data):
+  i = 0
+  tree_id = None
+  parent_ids = []
+  commit_msg = None
+  while 1:
+    j = commit_data.find('\n', i)
+    assert j > 0, 'Unexpected end of commit data.'
+    line = commit_data[i : j]  # Without the trailing '\n'.
+    i = j + 1
+    if line.startswith('tree '):
+      tree_id = line.split(' ', 1)[1]
+    if line.startswith('parent '):
+      parent_ids.append(line.split(' ', 1)[1])
+    if not line:  # Commit message follows.
+      commit_msg = commit_data[i:]
+      break
+  assert tree_id is not None, 'Missing tree_id in commit data.'
+  # We don't check for parent_ids, it can be empty (for the initial commit).
+  return tree_id, parent_ids, commit_msg
+
+
+def parse_commit_id_line(commit_id_line):
+  # TODO(pts): Use a regexp.
+  assert len(commit_id_line) == 41
+  assert commit_id_line.find('\n') == 40
+  return commit_id_line[:-1]
+
+
+def parse_line(line):
+  assert line
+  assert line.find('\n') == len(line) - 1
+  return line[:-1]
+
+
+def single_quote(s):
+  assert '\0' not in s
+  return "'%s'" % s.replace("'", "'\\''")
+
+
+def main(argv):
+  do_default_committer = False
+  if len(argv) > 1 and argv[1] == '--default-committer':
+    argv = list(argv)
+    del argv[1]
+    do_default_committer = True
+  exitcode = subprocess.call(('git', 'commit') + tuple(argv[1:]))
+  if exitcode:
+    sys.exit(exitcode)
+  commit_data = readpipe(('git', 'cat-file', 'commit', 'HEAD'))
+  tree_id, parent_ids, commit_msg = parse_commit_data(commit_data)
+  old_commit_id = parse_commit_id_line(readpipe(
+      ('git', 'rev-parse', '--revs-only', 'HEAD')))
+  files_changed = (readpipe(
+      ('git', 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'))
+      .splitlines())
+  if not files_changed:
+    print >>sys.stderr, 'warning: no files changed by the commit'
+    sys.exit(0)
+  # E.g. '', 'foo/' or 'foo/bar/'.
+  prefix = readpipe(('git', 'rev-parse', '--show-prefix'))
+  dotback = '../' * prefix.count('/')  # TODO(pts): What if symlinks?
+  timestamps = []
+  for filename in files_changed:
+    try:
+      st = os.lstat(dotback + filename)
+    except OSError, e:
+      if e[0] != errno.ENOENT:
+        raise
+      continue
+    timestamps.append(int(st.st_mtime))
+  if not timestamps:
+    # Deleted files can't be used.
+    print >>sys.stderr, 'error: no files in the commit, cannot get mtime'
+    sys.exit(2)
+  timestamp = max(timestamps)
+  assert timestamp >  99999999
+  print >>sys.stderr, 'info: dcommit timestamp: %s: %s +local' % (
+      timestamp, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp)))
+  # It's enough to send the environment updates to `git commit-tree'.
+  # git automatically adds the local time zone delta (e.g. +0100).
+  os.environ['GIT_AUTHOR_DATE'] = str(timestamp)
+  if not do_default_committer:
+    if 'GIT_AUTHOR_NAME' in os.environ:
+      os.environ['GIT_COMMITTER_NAME'] = os.environ['GIT_AUTHOR_NAME']
+    else:
+      os.environ['GIT_COMMITTER_NAME'] = parse_line(readpipe(
+          ('git', 'config', 'user.name')))
+    if 'GIT_AUTHOR_EMAIL' in os.environ:
+      os.environ['GIT_COMMITTER_EMAIL'] = os.environ['GIT_AUTHOR_EMAIL']
+    else:
+      os.environ['GIT_COMMITTER_EMAIL'] = parse_line(readpipe(
+          ('git', 'config', 'user.email')))
+    os.environ['GIT_COMMITTER_DATE'] = str(timestamp)
+  parent_id_args = []
+  for parent_id in parent_ids:
+    parent_id_args.append('-p')
+    parent_id_args.append(parent_id)
+  new_commit_id = parse_commit_id_line(readpipe(
+      ('git', 'commit-tree', tree_id) + tuple(parent_id_args), commit_msg))
+  call(('git', '-c', 'core.logAllRefUpdates=false', 'update-ref', 'HEAD',
+        new_commit_id, old_commit_id))
+  git_dir = parse_line(readpipe(('git', 'rev-parse', '--git-dir')))
+  obj_dir = os.path.join(git_dir, 'objects', old_commit_id[:2])
+  obj_file = os.path.join(obj_dir, old_commit_id[2:])
+  os.remove(obj_file)
+  try:
+    os.rmdir(obj_dir)
+  except OSError, e:
+    if e[0] != errno.ENOTEMPTY:
+      raise
+
+
+if __name__ == '__main__':
+  sys.exit(main(sys.argv))
