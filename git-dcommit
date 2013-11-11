@@ -10,6 +10,17 @@ type python2.4 >/dev/null 2>&1 && exec python2.4 -- "$0" ${1+"$@"}
 exec python -- ${1+"$@"}
 exit 1
 
+This script is a drop-in replacement for `git dcommit'. The only difference is
+that `git commit' uses the current time as the date for the newly created
+commit, and `git dcommit' uses the largest last-modification time of the
+files involved.
+
+To use this script, put it onto your $PATH, and run `git dcommit ...' instead
+of `git commit ...'.
+
+This script has been tested on Linux with Git 1.7. It should also work on other
+Unix system.s
+
 Takes the maximum last-modification date of files changed.
 """
 
